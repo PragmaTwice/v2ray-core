@@ -5,6 +5,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
+	"crypto/rc4"
 	"crypto/sha1"
 	"io"
 	"strings"
@@ -81,6 +82,8 @@ func (a *Account) getCipher() (Cipher, error) {
 			IVBytes:         32,
 			AEADAuthCreator: createChaCha20Poly1305,
 		}, nil
+	case CipherType_RC4_MD5:
+		return &RC4MD5Cipher{}, nil
 	case CipherType_NONE:
 		return NoneCipher{}, nil
 	default:
@@ -186,6 +189,57 @@ func (c *AEADCipher) DecodePacket(key []byte, b *buf.Buffer) error {
 	return nil
 }
 
+type RC4MD5Cipher struct{}
+
+func (rm *RC4MD5Cipher) KeySize() int32 {
+	return 16
+}
+
+func (rm *RC4MD5Cipher) IVSize() int32 {
+	return 16
+}
+
+func (rm *RC4MD5Cipher) newCipherStream(key []byte, iv []byte) cipher.Stream {
+	h := md5.New()
+	h.Write(key)
+	h.Write(iv)
+	rc4key := h.Sum(nil)
+	c, _ := rc4.NewCipher(rc4key)
+	return c
+}
+
+func (rm *RC4MD5Cipher) NewEncryptionWriter(key []byte, iv []byte, writer io.Writer) (buf.Writer, error) {
+	stream := rm.newCipherStream(key, iv)
+	return &buf.SequentialWriter{Writer: crypto.NewCryptionWriter(stream, writer)}, nil
+}
+
+func (rm *RC4MD5Cipher) NewDecryptionReader(key []byte, iv []byte, reader io.Reader) (buf.Reader, error) {
+	stream := rm.newCipherStream(key, iv)
+	return &buf.SingleReader{Reader: crypto.NewCryptionReader(stream, reader)}, nil
+}
+
+func (rm *RC4MD5Cipher) IsAEAD() bool {
+	return false
+}
+
+func (rm *RC4MD5Cipher) EncodePacket(key []byte, b *buf.Buffer) error {
+	iv := b.BytesTo(rm.IVSize())
+	stream := rm.newCipherStream(key, iv)
+	stream.XORKeyStream(b.BytesFrom(rm.IVSize()), b.BytesFrom(rm.IVSize()))
+	return nil
+}
+
+func (rm *RC4MD5Cipher) DecodePacket(key []byte, b *buf.Buffer) error {
+	if b.Len() <= rm.IVSize() {
+		return newError("insufficient data: ", b.Len())
+	}
+	iv := b.BytesTo(rm.IVSize())
+	stream := rm.newCipherStream(key, iv)
+	stream.XORKeyStream(b.BytesFrom(rm.IVSize()), b.BytesFrom(rm.IVSize()))
+	b.Advance(rm.IVSize())
+	return nil
+}
+
 type NoneCipher struct{}
 
 func (NoneCipher) KeySize() int32 { return 0 }
@@ -220,6 +274,8 @@ func CipherFromString(c string) CipherType {
 		return CipherType_CHACHA20_POLY1305
 	case "none", "plain":
 		return CipherType_NONE
+	case "rc4-md5":
+		return CipherType_RC4_MD5
 	default:
 		return CipherType_UNKNOWN
 	}
